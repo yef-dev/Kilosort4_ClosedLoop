@@ -8,3 +8,4 @@
     plotting_example
     improve_sorting
     benchmark
+    closed_loop_two_session_walkthrough

@@ -204,7 +204,7 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     F, ysamp = bin_spikes(ops, st)
 
     # the fingerprints are iteratively aligned to each other vertically
-    imin, yblk, _, _ = align_block2(F, ysamp, ops, device=device)
+    imin, yblk, F0, F0m = align_block2(F, ysamp, ops, device=device)
 
     # imin contains the shifts for each batch, in units of discrete bins
     # multiply back with binning_depth for microns
@@ -213,6 +213,9 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     # we save the variables needed for drift correction during the data preprocessing step
     ops['yblk'] = yblk
     ops['dshift'] = dshift 
+    ops['drift_fingerprint_depths'] = ysamp.astype(np.float32)
+    ops['drift_fingerprint'] = F0m.detach().cpu().numpy().astype(np.float32)
+    ops['drift_fingerprint_centered'] = F0.detach().cpu().numpy().astype(np.float32)
     xp = np.vstack((ops['xc'],ops['yc'])).T
 
     # for interpolation, we precompute a radial kernel based on distances between sites

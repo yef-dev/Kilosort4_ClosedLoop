@@ -491,6 +491,118 @@ EXTRA_PARAMETERS = {
             after sorting is complete.
             """
     },
+
+    'closed_loop_identity_mode': {
+        'gui_name': 'closed loop mode', 'type': str, 'min': None, 'max': None,
+        'exclude': [], 'default': 'off', 'step': 'postprocessing',
+        'description':
+            """
+            Optional closed-loop sorting mode. Use ``off`` for standard Kilosort4
+            behavior and ``preserve`` to carry template identities across loops.
+            """
+    },
+
+    'closed_loop_prior_path': {
+        'gui_name': 'closed loop prior path', 'type': str, 'min': None, 'max': None,
+        'exclude': [], 'default': None, 'step': 'postprocessing',
+        'description':
+            """
+            Optional path to a previously saved ``prior_bundle.npz`` for
+            identity-preserving closed-loop sorting.
+            """
+    },
+
+    'closed_loop_alignment_mode': {
+        'gui_name': 'closed loop alignment', 'type': str, 'min': None, 'max': None,
+        'exclude': [], 'default': 'rigid', 'step': 'postprocessing',
+        'description':
+            """
+            Cross-session alignment mode for closed-loop priors. ``rigid`` uses
+            one global depth offset. ``nonrigid`` first estimates a rigid
+            offset and then refines it with KS4-style depth-varying shifts.
+            """
+    },
+
+    'closed_loop_nonrigid_nblocks': {
+        'gui_name': 'closed loop nonrigid blocks', 'type': int, 'min': 0, 'max': np.inf,
+        'exclude': [], 'default': 0, 'step': 'postprocessing',
+        'description':
+            """
+            Number of non-overlapping blocks used for cross-session non-rigid
+            alignment. ``0`` inherits the current recording's drift block
+            layout.
+            """
+    },
+
+    'closed_loop_nonrigid_max_shift_um': {
+        'gui_name': 'closed loop nonrigid max shift', 'type': float, 'min': 0, 'max': np.inf,
+        'exclude': [0], 'default': 40.0, 'step': 'postprocessing',
+        'description':
+            """
+            Maximum local residual shift in microns searched around the coarse
+            rigid alignment when ``closed_loop_alignment_mode='nonrigid'``.
+            """
+    },
+
+    'closed_loop_nonrigid_smoothing': {
+        'gui_name': 'closed loop nonrigid smoothing', 'type': float, 'min': 0, 'max': np.inf,
+        'exclude': [], 'default': 1.0, 'step': 'postprocessing',
+        'description':
+            """
+            Gaussian smoothing applied across non-rigid shift blocks before the
+            final template warp is chosen.
+            """
+    },
+
+    'closed_loop_nonrigid_min_score_gain': {
+        'gui_name': 'closed loop nonrigid score gain', 'type': float, 'min': 0, 'max': np.inf,
+        'exclude': [], 'default': 0.01, 'step': 'postprocessing',
+        'description':
+            """
+            Minimum normalized alignment-score improvement required for the
+            non-rigid solution to replace the rigid baseline.
+            """
+    },
+
+    'closed_loop_nonrigid_max_residual_um': {
+        'gui_name': 'closed loop nonrigid max residual', 'type': float, 'min': 0, 'max': np.inf,
+        'exclude': [0], 'default': 60.0, 'step': 'postprocessing',
+        'description':
+            """
+            Maximum absolute residual shift allowed for a non-rigid alignment
+            before it is clipped and evaluated for acceptance.
+            """
+    },
+
+    'closed_loop_template_update_alpha': {
+        'gui_name': 'closed loop alpha', 'type': float, 'min': 0, 'max': 1,
+        'exclude': [], 'default': 0.25, 'step': 'postprocessing',
+        'description':
+            """
+            Blend factor used when adapting carried-over templates with current
+            session evidence.
+            """
+    },
+
+    'closed_loop_min_spikes_for_update': {
+        'gui_name': 'closed loop min spikes', 'type': int, 'min': 1, 'max': np.inf,
+        'exclude': [], 'default': 50, 'step': 'postprocessing',
+        'description':
+            """
+            Minimum number of matched spikes required before a carried-over
+            template is updated for the next loop.
+            """
+    },
+
+    'closed_loop_export_debug': {
+        'gui_name': 'closed loop debug export', 'type': bool, 'min': None, 'max': None,
+        'exclude': [], 'default': True, 'step': 'postprocessing',
+        'description':
+            """
+            If True, save cross-session debug arrays for visualization and
+            notebook-based inspection.
+            """
+    },
 }
 
 # Add default values to descriptions

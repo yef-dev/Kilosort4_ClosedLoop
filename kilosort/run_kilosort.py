@@ -10,7 +10,7 @@ import torch
 
 import kilosort
 from kilosort import (preprocessing, datashift, template_matching, clustering_qr, 
-                      clustering_qr, io, spikedetect, CCG, PROBE_DIR)
+                      clustering_qr, io, spikedetect, CCG, PROBE_DIR, closed_loop)
 from kilosort.parameters import DEFAULT_SETTINGS
 from kilosort.utils import (
     log_performance, log_cuda_details, probe_as_string, ops_as_string,
@@ -315,10 +315,21 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
         else:
             kplots.plot_diagnostics(Wall0, clu0, ops, results_dir)
 
-        clu, Wall, st, tF = cluster_spikes(
-            st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
-            clear_cache=clear_cache, verbose=verbose_log,
+        closed_loop_mode = ops['settings'].get('closed_loop_identity_mode', 'off')
+        if closed_loop_mode == 'preserve':
+            discovery_clu, discovery_Wall, discovery_st, discovery_tF = cluster_spikes(
+                st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
+                clear_cache=clear_cache, verbose=verbose_log,
+                )
+            clu, Wall, st, tF = closed_loop_sorting(
+                ops, device, bfile, discovery_st, discovery_clu, discovery_tF,
+                discovery_Wall, tic0=tic0, progress_bar=progress_bar,
             )
+        else:
+            clu, Wall, st, tF = cluster_spikes(
+                st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
+                clear_cache=clear_cache, verbose=verbose_log,
+                )
 
         log_thread_count(logger)
 
@@ -494,6 +505,49 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
         # cached settings values in the GUI don't cause disruption.
         settings['max_channel_distance'] = DEFAULT_SETTINGS['max_channel_distance']
 
+    closed_loop_mode = settings.get('closed_loop_identity_mode', 'off')
+    if closed_loop_mode not in ['off', 'preserve']:
+        raise ValueError(
+            "`closed_loop_identity_mode` must be 'off' or 'preserve', "
+            f"but got {closed_loop_mode!r}."
+        )
+    alignment_mode = settings.get('closed_loop_alignment_mode', 'rigid')
+    if alignment_mode not in ['rigid', 'nonrigid']:
+        raise ValueError(
+            "`closed_loop_alignment_mode` must be 'rigid' or 'nonrigid', "
+            f"but got {alignment_mode!r}."
+        )
+    if settings.get('closed_loop_nonrigid_nblocks', 0) < 0:
+        raise ValueError(
+            "`closed_loop_nonrigid_nblocks` must be >= 0, "
+            f"but got {settings['closed_loop_nonrigid_nblocks']!r}."
+        )
+    if settings.get('closed_loop_nonrigid_max_shift_um', 0) <= 0:
+        raise ValueError(
+            "`closed_loop_nonrigid_max_shift_um` must be > 0, "
+            f"but got {settings['closed_loop_nonrigid_max_shift_um']!r}."
+        )
+    if settings.get('closed_loop_nonrigid_smoothing', 0) < 0:
+        raise ValueError(
+            "`closed_loop_nonrigid_smoothing` must be >= 0, "
+            f"but got {settings['closed_loop_nonrigid_smoothing']!r}."
+        )
+    if settings.get('closed_loop_nonrigid_min_score_gain', 0) < 0:
+        raise ValueError(
+            "`closed_loop_nonrigid_min_score_gain` must be >= 0, "
+            f"but got {settings['closed_loop_nonrigid_min_score_gain']!r}."
+        )
+    if settings.get('closed_loop_nonrigid_max_residual_um', 0) <= 0:
+        raise ValueError(
+            "`closed_loop_nonrigid_max_residual_um` must be > 0, "
+            f"but got {settings['closed_loop_nonrigid_max_residual_um']!r}."
+        )
+    if closed_loop_mode == 'preserve' and not settings.get('closed_loop_prior_path'):
+        raise ValueError(
+            "`closed_loop_prior_path` must be set when "
+            "`closed_loop_identity_mode='preserve'`."
+        )
+
     if settings['nearest_chans'] > len(probe['chanMap']):
         msg = f"""
             Parameter `nearest_chans` must be less than or equal to the number 
@@ -549,6 +603,7 @@ def initialize_ops(settings, probe, data_dtype, do_CAR, invert_sign,
                          '(templates_from_data=False), nt must be 61')
 
     ops = {**ops, **probe}
+    ops = closed_loop.default_closed_loop_state(ops)
 
     return ops, settings
 
@@ -951,6 +1006,423 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     return clu, Wall, st, tF
 
 
+def closed_loop_sorting(ops, device, bfile, discovery_st, discovery_clu,
+                        discovery_tF, discovery_Wall, tic0=np.nan,
+                        progress_bar=None):
+    tic = time.time()
+    logger.info(' ')
+    logger.info('Closed-loop identity preservation')
+    logger.info('-'*40)
+
+    prior_bundle = closed_loop.load_prior_bundle(
+        ops['settings']['closed_loop_prior_path']
+    )
+    ops['closed_loop_enabled'] = True
+    ops['closed_loop_loop_index'] = closed_loop.next_loop_index(prior_bundle)
+
+    current_depths, current_fingerprint = closed_loop.build_fingerprint_from_ops(ops)
+    rigid_shift_um, rigid_debug = closed_loop.estimate_rigid_shift(
+        prior_bundle.get('fingerprint_depths'),
+        prior_bundle.get('fingerprint'),
+        current_depths,
+        current_fingerprint,
+        ops['binning_depth'],
+    )
+    ops['closed_loop_rigid_shift_um'] = rigid_shift_um
+    alignment_mode_requested = ops['settings'].get('closed_loop_alignment_mode', 'rigid')
+    chosen_alignment_mode = 'rigid'
+    chosen_shifts = None
+    alignment_debug = {
+        'rigid_candidate_shifts_um': rigid_debug['candidate_shifts_um'],
+        'rigid_scores': rigid_debug['scores'],
+        'rigid_score': float(rigid_debug.get('best_score', 0.0)),
+        'aligned_rigid_fingerprint': np.asarray(
+            rigid_debug['aligned_prior_fingerprint']
+            if rigid_debug['aligned_prior_fingerprint'] is not None
+            else np.zeros((0, 0)),
+            dtype=np.float32,
+        ),
+        'alignment_mode_requested': alignment_mode_requested,
+        'alignment_mode_used': 'rigid',
+        'alignment_fallback_reason': '',
+        'nonrigid_block_depths': np.zeros(0, dtype=np.float32),
+        'nonrigid_block_shifts_um': np.zeros(0, dtype=np.float32),
+        'nonrigid_depth_shifts_um': np.zeros(0, dtype=np.float32),
+        'aligned_nonrigid_fingerprint': np.asarray(
+            rigid_debug['aligned_prior_fingerprint']
+            if rigid_debug['aligned_prior_fingerprint'] is not None
+            else np.zeros((0, 0)),
+            dtype=np.float32,
+        ),
+        'nonrigid_score': float(rigid_debug.get('best_score', 0.0)),
+        'nonrigid_score_gain': 0.0,
+        'nonrigid_accepted': False,
+    }
+    if alignment_mode_requested == 'nonrigid':
+        chosen_shifts, nonrigid_debug = closed_loop.estimate_nonrigid_shift(
+            prior_bundle,
+            current_depths,
+            current_fingerprint,
+            rigid_shift_um,
+            ops,
+        )
+        chosen_alignment_mode = nonrigid_debug['used_mode']
+        alignment_debug.update({
+            'alignment_mode_used': chosen_alignment_mode,
+            'alignment_fallback_reason': nonrigid_debug['fallback_reason'],
+            'nonrigid_block_depths': nonrigid_debug['nonrigid_block_depths'],
+            'nonrigid_block_shifts_um': nonrigid_debug['nonrigid_block_shifts_um'],
+            'nonrigid_depth_shifts_um': nonrigid_debug['nonrigid_depth_shifts_um'],
+            'aligned_nonrigid_fingerprint': nonrigid_debug['aligned_nonrigid_fingerprint'],
+            'nonrigid_score': float(nonrigid_debug['nonrigid_score']),
+            'nonrigid_score_gain': float(nonrigid_debug.get('score_gain', 0.0)),
+            'nonrigid_accepted': bool(nonrigid_debug['accepted']),
+        })
+    else:
+        chosen_shifts = np.asarray(rigid_shift_um, dtype=np.float32)
+
+    ops['closed_loop_alignment_mode_requested'] = alignment_mode_requested
+    ops['closed_loop_alignment_mode_used'] = chosen_alignment_mode
+    ops['closed_loop_alignment_fallback_reason'] = alignment_debug['alignment_fallback_reason']
+    logger.info(
+        'Closed-loop alignment requested=%s used=%s rigid_shift=%.2fum',
+        alignment_mode_requested,
+        chosen_alignment_mode,
+        rigid_shift_um,
+    )
+    if alignment_mode_requested == 'nonrigid' and alignment_debug['alignment_fallback_reason']:
+        logger.info(
+            'Closed-loop nonrigid fallback reason: %s',
+            alignment_debug['alignment_fallback_reason'],
+        )
+
+    matching_prior_mask = closed_loop.select_matching_prior_mask(prior_bundle)
+    matching_prior_indices = np.flatnonzero(matching_prior_mask)
+    if matching_prior_indices.size == 0 and prior_bundle['global_unit_ids'].size:
+        matching_prior_indices = np.arange(
+            prior_bundle['global_unit_ids'].size, dtype=np.int32
+        )
+        matching_prior_mask = np.ones_like(prior_bundle['global_unit_ids'], dtype=bool)
+
+    if chosen_alignment_mode == 'nonrigid':
+        aligned_templates = closed_loop.warp_templates_nonrigid(
+            prior_bundle['templates'],
+            ops,
+            alignment_debug['nonrigid_block_depths'],
+            alignment_debug['nonrigid_block_shifts_um'],
+            device=device,
+        ).detach().cpu().numpy()
+    else:
+        aligned_templates = closed_loop.warp_templates_rigid(
+            prior_bundle['templates'], ops, rigid_shift_um, device=device
+        ).detach().cpu().numpy()
+    aligned_wall = closed_loop.wall_from_templates(
+        aligned_templates, ops['wPCA'], device=device
+        )
+
+    matching_templates = aligned_wall[matching_prior_indices].transpose(1, 2).contiguous()
+    logger.info(
+        'Closed-loop prior matching using %d of %d saved templates',
+        matching_prior_indices.size,
+        prior_bundle['global_unit_ids'].size,
+    )
+    st_prior, tF_prior, _ = template_matching.extract(
+        ops, bfile, matching_templates, device=device, progress_bar=progress_bar
+    )
+    matching_counts = np.bincount(
+        st_prior[:,1].astype(np.int32),
+        minlength=matching_templates.shape[0]
+    ).astype(np.int32)
+    prior_counts = np.zeros(prior_bundle['global_unit_ids'].size, dtype=np.int32)
+    prior_counts[matching_prior_indices] = matching_counts
+    prior_active = prior_counts > 0
+
+    _, _, disc_anchor_y = closed_loop.template_positions_from_wall(
+        discovery_Wall, ops['xc'], ops['yc']
+        )
+    _, prior_anchor_x, prior_anchor_y = closed_loop.template_positions_from_wall(
+        aligned_wall, ops['xc'], ops['yc']
+        )
+
+    active_indices = np.flatnonzero(prior_active)
+    active_matching_indices = np.flatnonzero(matching_counts > 0)
+    active_prior_st = st_prior[
+        np.isin(st_prior[:,1].astype(np.int32), active_matching_indices)
+    ].copy()
+    if active_prior_st.size:
+        active_prior_local = {
+            prior_idx: local_idx for local_idx, prior_idx in enumerate(active_matching_indices)
+        }
+        active_prior_st[:,1] = np.array(
+            [active_prior_local[i] for i in active_prior_st[:,1].astype(np.int32)],
+            dtype=np.int32,
+        )
+
+    reconcile = closed_loop.reconcile_discovery_units(
+        aligned_wall[active_indices],
+        discovery_Wall,
+        active_prior_st,
+        discovery_st,
+        discovery_clu,
+        prior_anchor_y[matching_prior_indices][active_matching_indices],
+        disc_anchor_y,
+        ops,
+        )
+
+    duplicate_pairs = {}
+    for disc_idx, info in reconcile['duplicate_pairs'].items():
+        duplicate_pairs[disc_idx] = {
+            **info,
+            'prior_index': int(active_indices[info['prior_index']]),
+        }
+
+    adapted_templates, adapted_wall, adapted_mask, adaptation_source = \
+        closed_loop.adapt_carried_templates(
+            aligned_templates,
+            aligned_wall,
+            prior_counts,
+            duplicate_pairs,
+            discovery_Wall,
+            ops['settings']['closed_loop_template_update_alpha'],
+            ops['settings']['closed_loop_min_spikes_for_update'],
+            ops['wPCA'],
+            device=device,
+        )
+
+    kept_new_units = reconcile['kept_new_units']
+    kept_new_indices = np.flatnonzero(kept_new_units)
+
+    next_global_id = int(prior_bundle['global_unit_ids'].max()) + 1 \
+        if prior_bundle['global_unit_ids'].size else 0
+    active_prior_indices = np.flatnonzero(prior_active)
+    active_global_ids = prior_bundle['global_unit_ids'][active_prior_indices]
+    new_global_ids = np.arange(
+        next_global_id, next_global_id + kept_new_indices.size, dtype=np.int32
+        )
+
+    final_wall_parts = []
+    if active_prior_indices.size:
+        final_wall_parts.append(adapted_wall[active_prior_indices].to(device))
+    if kept_new_indices.size:
+        final_wall_parts.append(discovery_Wall[kept_new_indices].to(device))
+    if final_wall_parts:
+        final_Wall = torch.cat(final_wall_parts, dim=0)
+    else:
+        final_Wall = torch.zeros(
+            (0, discovery_Wall.shape[1], discovery_Wall.shape[2]),
+            dtype=discovery_Wall.dtype,
+        )
+    final_local_to_global = np.concatenate(
+        [active_global_ids, new_global_ids]
+        ).astype(np.int32)
+
+    active_local_map = {
+        prior_idx: new_idx
+        for new_idx, prior_idx in enumerate(active_prior_indices)
+    }
+    kept_new_map = {
+        disc_idx: active_prior_indices.size + offset
+        for offset, disc_idx in enumerate(kept_new_indices)
+    }
+
+    prior_spike_mask = np.isin(
+        st_prior[:,1].astype(np.int32), active_matching_indices
+    )
+    prior_st_keep = st_prior[prior_spike_mask].copy()
+    prior_tF_keep = tF_prior[prior_spike_mask]
+    if prior_st_keep.size:
+        matched_prior_ids = matching_prior_indices[prior_st_keep[:,1].astype(np.int32)]
+        prior_local_ids = np.array(
+            [active_local_map[i] for i in matched_prior_ids],
+            dtype=np.int32,
+        )
+        prior_st_keep[:,1] = prior_local_ids
+        prior_clu = prior_local_ids.astype(np.int32)
+    else:
+        prior_clu = np.zeros(0, dtype=np.int32)
+
+    disc_keep_mask = np.isin(discovery_clu, kept_new_indices)
+    disc_st_keep = discovery_st[disc_keep_mask].copy()
+    disc_tF_keep = discovery_tF[disc_keep_mask]
+    disc_clu_keep = discovery_clu[disc_keep_mask].astype(np.int32)
+    if disc_st_keep.size:
+        disc_local_ids = np.array([kept_new_map[i] for i in disc_clu_keep], dtype=np.int32)
+        disc_st_keep[:,1] = disc_local_ids
+        disc_clu_keep = disc_local_ids.astype(np.int32)
+    else:
+        disc_clu_keep = np.zeros(0, dtype=np.int32)
+
+    if prior_st_keep.size and disc_st_keep.size:
+        final_st = np.concatenate([prior_st_keep, disc_st_keep], axis=0)
+        final_tF = torch.cat([prior_tF_keep, disc_tF_keep], dim=0)
+        final_clu = np.concatenate([prior_clu, disc_clu_keep], axis=0)
+    elif prior_st_keep.size:
+        final_st = prior_st_keep
+        final_tF = prior_tF_keep
+        final_clu = prior_clu
+    else:
+        final_st = disc_st_keep
+        final_tF = disc_tF_keep
+        final_clu = disc_clu_keep
+
+    if final_st.size:
+        order = np.argsort(final_st[:,0])
+        final_st = final_st[order]
+        final_clu = final_clu[order].astype(np.int32)
+        final_tF = final_tF[torch.from_numpy(order)]
+
+    _, anchor_x, anchor_y = closed_loop.template_positions_from_wall(
+        final_Wall, ops['xc'], ops['yc']
+        )
+    ops['closed_loop_feature_ind'] = closed_loop.compute_feature_ind(
+        final_Wall, ops['settings']['nearest_chans']
+        )
+    ops['closed_loop_anchor_x'] = anchor_x.astype(np.float32)
+    ops['closed_loop_anchor_y'] = anchor_y.astype(np.float32)
+    ops['closed_loop_cluster_global_ids'] = final_local_to_global
+    ops['closed_loop_spike_global_ids'] = final_local_to_global[final_clu] \
+        if final_clu.size else np.zeros(0, dtype=np.int32)
+    ops['closed_loop_spike_positions'] = closed_loop.build_spike_positions(
+        final_clu, ops['closed_loop_anchor_x'], ops['closed_loop_anchor_y']
+        ) if final_clu.size else np.zeros((0, 2), dtype=np.float32)
+    ops['closed_loop_num_carried'] = int(active_prior_indices.size)
+    ops['closed_loop_num_new'] = int(kept_new_indices.size)
+    ops['closed_loop_num_stale'] = int((~prior_active).sum())
+    ops['closed_loop_matching_prior_ids'] = \
+        prior_bundle['global_unit_ids'][matching_prior_indices].astype(np.int32)
+    ops['closed_loop_matching_prior_count'] = int(matching_prior_indices.size)
+
+    map_rows = []
+    similarity = reconcile['similarity']
+    overlap = reconcile['overlap']
+    for local_idx, prior_idx in enumerate(active_prior_indices):
+        duplicate_disc = int(adaptation_source[prior_idx])
+        match_conf = 1.0 if prior_counts[prior_idx] > 0 else 0.0
+        dup_sim = ''
+        dup_overlap = ''
+        if duplicate_disc >= 0:
+            dup_sim = float(similarity[active_local_map[prior_idx], duplicate_disc])
+            dup_overlap = float(overlap[active_local_map[prior_idx], duplicate_disc])
+        map_rows.append({
+            'local_cluster_id': local_idx,
+            'global_unit_id': int(final_local_to_global[local_idx]),
+            'source_loop': int(prior_bundle['source_loop'][prior_idx]),
+            'status': 'carried',
+            'match_confidence': match_conf,
+            'adapted': bool(adapted_mask[prior_idx]),
+            'n_spikes_matched': int(prior_counts[prior_idx]),
+            'duplicate_similarity': dup_sim,
+            'duplicate_overlap': dup_overlap,
+        })
+    for offset, disc_idx in enumerate(kept_new_indices):
+        local_idx = active_prior_indices.size + offset
+        map_rows.append({
+            'local_cluster_id': local_idx,
+            'global_unit_id': int(final_local_to_global[local_idx]),
+            'source_loop': int(ops['closed_loop_loop_index']),
+            'status': 'new',
+            'match_confidence': 0.0,
+            'adapted': False,
+            'n_spikes_matched': int((disc_clu_keep == local_idx).sum()),
+            'duplicate_similarity': '',
+            'duplicate_overlap': '',
+        })
+    for prior_idx in np.flatnonzero(~prior_active):
+        map_rows.append({
+            'local_cluster_id': -1,
+            'global_unit_id': int(prior_bundle['global_unit_ids'][prior_idx]),
+            'source_loop': int(prior_bundle['source_loop'][prior_idx]),
+            'status': 'stale',
+            'match_confidence': 0.0,
+            'adapted': False,
+            'n_spikes_matched': 0,
+            'duplicate_similarity': '',
+            'duplicate_overlap': '',
+        })
+    ops['closed_loop_map_rows'] = map_rows
+    ops['closed_loop_summary'] = {
+        'enabled': True,
+        'loop_index': int(ops['closed_loop_loop_index']),
+        'rigid_shift_um': float(rigid_shift_um),
+        'alignment_mode_requested': alignment_mode_requested,
+        'alignment_mode_used': chosen_alignment_mode,
+        'alignment_fallback_reason': alignment_debug['alignment_fallback_reason'],
+        'rigid_score': float(alignment_debug['rigid_score']),
+        'nonrigid_score': float(alignment_debug['nonrigid_score']),
+        'nonrigid_score_gain': float(alignment_debug['nonrigid_score_gain']),
+        'nonrigid_accepted': bool(alignment_debug['nonrigid_accepted']),
+        'n_carried': int(active_prior_indices.size),
+        'n_new': int(kept_new_indices.size),
+        'n_stale': int((~prior_active).sum()),
+        'n_matching_candidates': int(matching_prior_indices.size),
+        'prior_path': str(ops['settings']['closed_loop_prior_path']),
+    }
+    debug = {
+        'candidate_shifts_um': alignment_debug['rigid_candidate_shifts_um'],
+        'alignment_scores': alignment_debug['rigid_scores'],
+        'current_fingerprint': np.asarray(
+            current_fingerprint if current_fingerprint is not None else np.zeros((0, 0)),
+            dtype=np.float32,
+        ),
+        'current_fingerprint_depths': np.asarray(
+            current_depths if current_depths is not None else np.zeros(0),
+            dtype=np.float32,
+        ),
+        'aligned_prior_fingerprint': np.asarray(
+            alignment_debug['aligned_nonrigid_fingerprint']
+            if chosen_alignment_mode == 'nonrigid'
+            else alignment_debug['aligned_rigid_fingerprint'],
+            dtype=np.float32,
+        ),
+        'aligned_rigid_fingerprint': alignment_debug['aligned_rigid_fingerprint'],
+        'aligned_nonrigid_fingerprint': alignment_debug['aligned_nonrigid_fingerprint'],
+        'alignment_mode_requested': np.array([alignment_mode_requested]),
+        'alignment_mode_used': np.array([chosen_alignment_mode]),
+        'alignment_fallback_reason': np.array([alignment_debug['alignment_fallback_reason']]),
+        'rigid_score': np.array([alignment_debug['rigid_score']], dtype=np.float32),
+        'nonrigid_score': np.array([alignment_debug['nonrigid_score']], dtype=np.float32),
+        'nonrigid_score_gain': np.array([alignment_debug['nonrigid_score_gain']], dtype=np.float32),
+        'nonrigid_block_depths': alignment_debug['nonrigid_block_depths'],
+        'nonrigid_block_shifts_um': alignment_debug['nonrigid_block_shifts_um'],
+        'nonrigid_depth_shifts_um': alignment_debug['nonrigid_depth_shifts_um'],
+        'template_similarity': similarity.astype(np.float32),
+        'template_overlap': overlap.astype(np.float32),
+        'carried_global_ids': active_global_ids.astype(np.int32),
+        'new_global_ids': new_global_ids.astype(np.int32),
+        'prior_counts': prior_counts.astype(np.int32),
+        'matching_prior_global_ids': prior_bundle['global_unit_ids'][
+            matching_prior_indices
+        ].astype(np.int32),
+    }
+    if ops['settings'].get('closed_loop_export_debug', True):
+        debug['aligned_prior_templates'] = adapted_templates.astype(np.float32)
+        debug['discovery_templates'] = closed_loop.templates_from_wall(
+            discovery_Wall, ops['wPCA']
+            ).astype(np.float32)
+    ops['closed_loop_debug'] = debug
+    ops['closed_loop_prior_status'] = np.array(
+        ['active' if is_active else 'stale' for is_active in prior_active]
+        )
+    ops['closed_loop_prior_global_ids'] = prior_bundle['global_unit_ids']
+    ops['closed_loop_prior_base_templates'] = adapted_templates.astype(np.float32)
+    ops['closed_loop_prior_base_source_loop'] = prior_bundle['source_loop'].astype(np.int32)
+    ops['closed_loop_prior_base_is_ref'] = prior_bundle['is_ref'].astype(np.float32)
+    ops['closed_loop_prior_base_est_contam_rate'] = prior_bundle['est_contam_rate'].astype(np.float32)
+    ops['closed_loop_new_templates'] = closed_loop.templates_from_wall(
+        discovery_Wall[kept_new_indices], ops['wPCA']
+        ).astype(np.float32)
+    ops['closed_loop_new_global_ids'] = new_global_ids.astype(np.int32)
+
+    elapsed = time.time() - tic
+    total = time.time() - tic0
+    ops['runtime_closed_loop'] = elapsed
+    logger.info(
+        f'closed-loop reconciliation finished in {elapsed:.2f}s; total {total:.2f}s'
+    )
+
+    return final_clu, final_Wall, final_st, final_tF
+
+
 def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
                  save_extra_vars=False, save_preprocessed_copy=False,
                  skip_dat_path=False):  
@@ -1022,6 +1494,9 @@ def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
     logger.info(' ')
     logger.info('Saving to phy and computing refractory periods')
     logger.info('-'*40)
+    if ops.get('closed_loop_cluster_global_ids', None) is None:
+        ops['closed_loop_cluster_global_ids'] = np.arange(Wall.shape[0], dtype=np.int32)
+        ops['closed_loop_spike_global_ids'] = clu.astype(np.int32)
     results_dir, similar_templates, is_ref, est_contam_rate, kept_spikes = \
         io.save_to_phy(
             st, clu, tF, Wall, ops['probe'], ops, imin, results_dir=results_dir,
@@ -1053,7 +1528,119 @@ def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
     logger.info(f'Total runtime: {runtime:.2f}s = {int(hrs):02d}:' +
                 f'{int(mins):02d}:{round(seconds)} h:m:s')
     ops['runtime'] = runtime 
+
+    if ops.get('closed_loop_anchor_x', None) is None:
+        peak_channel, anchor_x, anchor_y = closed_loop.template_positions_from_wall(
+            Wall, ops['xc'], ops['yc']
+            )
+        ops['closed_loop_anchor_x'] = anchor_x.astype(np.float32)
+        ops['closed_loop_anchor_y'] = anchor_y.astype(np.float32)
+        ops['closed_loop_spike_positions'] = closed_loop.build_spike_positions(
+            clu.astype(np.int32), ops['closed_loop_anchor_x'], ops['closed_loop_anchor_y']
+            )
+        ops['closed_loop_feature_ind'] = closed_loop.compute_feature_ind(
+            Wall, ops['settings']['nearest_chans']
+            )
+        ops['closed_loop_map_rows'] = [
+            {
+                'local_cluster_id': int(i),
+                'global_unit_id': int(i),
+                'source_loop': int(ops.get('closed_loop_loop_index', 0)),
+                'status': 'local',
+                'match_confidence': 1.0,
+                'adapted': False,
+                'n_spikes_matched': int((clu == i).sum()),
+                'duplicate_similarity': '',
+                'duplicate_overlap': '',
+            }
+            for i in range(Wall.shape[0])
+        ]
+        ops['closed_loop_summary'] = {
+            'enabled': False,
+            'loop_index': int(ops.get('closed_loop_loop_index', 0)),
+            'rigid_shift_um': float(ops.get('closed_loop_rigid_shift_um', 0.0)),
+            'n_carried': 0,
+            'n_new': int(Wall.shape[0]),
+            'n_stale': 0,
+            'prior_path': None,
+        }
+        if ops['settings'].get('closed_loop_export_debug', True):
+            depths, fingerprint = closed_loop.build_fingerprint_from_ops(ops)
+            ops['closed_loop_debug'] = {
+                'current_fingerprint_depths': np.asarray(
+                    depths if depths is not None else np.zeros(0), dtype=np.float32
+                ),
+                'current_fingerprint': np.asarray(
+                    fingerprint if fingerprint is not None else np.zeros((0, 0)), dtype=np.float32
+                ),
+            }
     io.save_ops(ops, results_dir)
+    closed_loop.save_cross_loop_outputs(results_dir, ops)
+
+    if ops.get('closed_loop_prior_base_templates', None) is not None:
+        current_global = {
+            int(gid): local_idx
+            for local_idx, gid in enumerate(ops['closed_loop_cluster_global_ids'])
+        }
+        prior_gids = ops['closed_loop_prior_global_ids'].astype(np.int32)
+        prior_status = ops['closed_loop_prior_status']
+        prior_templates = ops['closed_loop_prior_base_templates']
+        next_templates = []
+        next_gids = []
+        next_status = []
+        next_source_loop = []
+        next_is_ref = []
+        next_est = []
+        for idx, gid in enumerate(prior_gids):
+            next_templates.append(prior_templates[idx])
+            next_gids.append(gid)
+            next_status.append(prior_status[idx])
+            next_source_loop.append(ops['closed_loop_prior_base_source_loop'][idx])
+            if int(gid) in current_global:
+                local_idx = current_global[int(gid)]
+                next_is_ref.append(is_ref[local_idx])
+                next_est.append(est_contam_rate[local_idx])
+            else:
+                next_is_ref.append(ops['closed_loop_prior_base_is_ref'][idx])
+                next_est.append(ops['closed_loop_prior_base_est_contam_rate'][idx])
+        for offset, gid in enumerate(ops['closed_loop_new_global_ids']):
+            next_templates.append(ops['closed_loop_new_templates'][offset])
+            next_gids.append(gid)
+            next_status.append('new')
+            next_source_loop.append(ops['closed_loop_loop_index'])
+            local_idx = current_global[int(gid)]
+            next_is_ref.append(is_ref[local_idx])
+            next_est.append(est_contam_rate[local_idx])
+
+        prior_templates_save = np.asarray(next_templates, dtype=np.float32)
+        prior_global_ids_save = np.asarray(next_gids, dtype=np.int32)
+        prior_status_save = np.asarray(next_status)
+        prior_source_loop_save = np.asarray(next_source_loop, dtype=np.int32)
+        prior_is_ref_save = np.asarray(next_is_ref, dtype=np.float32)
+        prior_est_save = np.asarray(next_est, dtype=np.float32)
+    else:
+        prior_templates_save = closed_loop.templates_from_wall(Wall, ops['wPCA']).astype(np.float32)
+        prior_global_ids_save = ops['closed_loop_cluster_global_ids']
+        prior_status_save = np.array(['active'] * len(prior_global_ids_save))
+        prior_source_loop_save = np.full(
+            len(prior_global_ids_save),
+            int(ops.get('closed_loop_loop_index', 0)),
+            dtype=np.int32,
+        )
+        prior_is_ref_save = np.asarray(is_ref, dtype=np.float32)
+        prior_est_save = np.asarray(est_contam_rate, dtype=np.float32)
+
+    closed_loop.save_prior_bundle(
+        results_dir / 'prior_bundle.npz',
+        ops,
+        closed_loop.wall_from_templates(prior_templates_save, ops['wPCA']),
+        prior_global_ids_save,
+        prior_is_ref_save,
+        prior_est_save,
+        results_dir,
+        status=prior_status_save,
+        source_loop=prior_source_loop_save,
+    )
     logger.info(f'Sorting output saved in: {results_dir}.')
 
     log_cuda_details(logger)

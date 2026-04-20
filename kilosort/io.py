@@ -348,8 +348,11 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     spike_times = st[:,0].astype('int64') + imin  # shift by minimum sample index
     spike_templates = st[:,1].astype('int32')
     spike_clusters = clu
-    xs, ys = compute_spike_positions(st, tF, ops)
-    spike_positions = np.vstack([xs, ys]).T
+    if ops.get('closed_loop_spike_positions', None) is not None:
+        spike_positions = np.asarray(ops['closed_loop_spike_positions'], dtype=np.float32)
+    else:
+        xs, ys = compute_spike_positions(st, tF, ops)
+        spike_positions = np.vstack([xs, ys]).T
     amplitudes = torch.norm(tF, dim=[-2,-1]).cpu().numpy()
     log_performance(logger, level='debug', header='save_to_phy, spike positions',
                     reset=True)
@@ -370,6 +373,12 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # Save spike mask so that it can be applied to other variables if needed
     # when loading results.
     np.save((results_dir / 'kept_spikes.npy'), kept_spikes)
+    if ops.get('closed_loop_spike_global_ids', None) is not None:
+        spike_global_ids = np.asarray(ops['closed_loop_spike_global_ids'], dtype=np.int32)
+        np.save((results_dir / 'spike_global_ids.npy'), spike_global_ids[kept_spikes])
+    if ops.get('closed_loop_cluster_global_ids', None) is not None:
+        cluster_global_ids = np.asarray(ops['closed_loop_cluster_global_ids'], dtype=np.int32)
+        np.save((results_dir / 'cluster_global_ids.npy'), cluster_global_ids)
     log_performance(logger, level='debug', header='save_to_phy, remove duplicates',
                     reset=True)
 
@@ -392,9 +401,13 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # This will momentarily copy tF which is pretty large, but it's on CPU
     # so the extra memory hopefully won't be an issue.
     tF = tF[kept_spikes]
-    pc_features, pc_feature_ind = make_pc_features(
-        ops, spike_templates, spike_clusters, tF
-        )
+    if ops.get('closed_loop_feature_ind', None) is not None:
+        pc_features = torch.permute(tF, (0, 2, 1)).cpu().numpy()
+        pc_feature_ind = np.asarray(ops['closed_loop_feature_ind'], dtype=np.uint32)
+    else:
+        pc_features, pc_feature_ind = make_pc_features(
+            ops, spike_templates, spike_clusters, tF
+            )
     np.save(results_dir / 'pc_features.npy', pc_features)
     np.save(results_dir / 'pc_feature_ind.npy', pc_feature_ind)
     log_performance(logger, level='debug', header='save_to_phy, pc features',
