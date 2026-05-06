@@ -429,7 +429,7 @@ def next_loop_index(prior_bundle):
     return int(prior_bundle["metadata"].get("loop_index", 0)) + 1
 
 
-def select_matching_prior_mask(prior_bundle):
+def select_matching_prior_mask(prior_bundle, use_ref=False):
     global_ids = np.asarray(prior_bundle.get("global_unit_ids", np.zeros(0, dtype=np.int32)))
     n_prior = global_ids.size
     if n_prior == 0:
@@ -440,12 +440,13 @@ def select_matching_prior_mask(prior_bundle):
     ).astype("U16")
     keep_status = status != "dropped"
 
-    is_ref = np.asarray(
-        prior_bundle.get("is_ref", np.ones(n_prior, dtype=np.float32)),
-        dtype=np.float32,
-    ) > 0.5
-    if np.any(keep_status & is_ref):
-        return keep_status & is_ref
+    if use_ref:
+        is_ref = np.asarray(
+            prior_bundle.get("is_ref", np.ones(n_prior, dtype=np.float32)),
+            dtype=np.float32,
+        ) > 0.5
+        if np.any(keep_status & is_ref):
+            return keep_status & is_ref
 
     est_contam = np.asarray(
         prior_bundle.get("est_contam_rate", np.zeros(n_prior, dtype=np.float32)),
